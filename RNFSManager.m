@@ -23,11 +23,14 @@
 @interface RNFSManager()
 
 @property (retain) NSMutableDictionary* downloaders;
+@property (retain) NSMutableDictionary* uuids;
 @property (retain) NSMutableDictionary* uploaders;
 
 @end
 
 @implementation RNFSManager
+
+static NSMutableDictionary *completionHandlers;
 
 @synthesize bridge = _bridge;
 
@@ -36,6 +39,11 @@ RCT_EXPORT_MODULE();
 - (dispatch_queue_t)methodQueue
 {
   return dispatch_queue_create("pe.lum.rnfs", DISPATCH_QUEUE_SERIAL);
+}
+
++ (BOOL)requiresMainQueueSetup
+{
+  return NO;
 }
 
 RCT_EXPORT_METHOD(readDir:(NSString *)dirPath
@@ -154,30 +162,30 @@ RCT_EXPORT_METHOD(write:(NSString *)filepath
                   rejecter:(RCTPromiseRejectBlock)reject)
 {
   NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Content options:NSDataBase64DecodingIgnoreUnknownCharacters];
-  
+
   NSFileManager *fM = [NSFileManager defaultManager];
-  
+
   if (![fM fileExistsAtPath:filepath])
   {
     BOOL success = [[NSFileManager defaultManager] createFileAtPath:filepath contents:data attributes:nil];
-    
+
     if (!success) {
       return reject(@"ENOENT", [NSString stringWithFormat:@"ENOENT: no such file or directory, open '%@'", filepath], nil);
     } else {
       return resolve(nil);
     }
   }
-  
+
   @try {
     NSFileHandle *fH = [NSFileHandle fileHandleForUpdatingAtPath:filepath];
-    
+
     if (position >= 0) {
       [fH seekToFileOffset:position];
     } else {
       [fH seekToEndOfFile];
     }
     [fH writeData:data];
-    
+
     return resolve(nil);
   } @catch (NSException *e) {
     return reject(@"ENOENT", [NSString stringWithFormat:@"ENOENT: error writing file: '%@'", filepath], nil);
@@ -268,41 +276,41 @@ RCT_EXPORT_METHOD(read:(NSString *)filepath
                   rejecter:(RCTPromiseRejectBlock)reject)
 {
     BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:filepath];
-    
+
     if (!fileExists) {
         return reject(@"ENOENT", [NSString stringWithFormat:@"ENOENT: no such file or directory, open '%@'", filepath], nil);
     }
-    
+
     NSError *error = nil;
-    
+
     NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:filepath error:&error];
-    
+
     if (error) {
         return [self reject:reject withError:error];
     }
-    
+
     if ([attributes objectForKey:NSFileType] == NSFileTypeDirectory) {
         return reject(@"EISDIR", @"EISDIR: illegal operation on a directory, read", nil);
     }
-    
+
     // Open the file handler.
     NSFileHandle *file = [NSFileHandle fileHandleForReadingAtPath:filepath];
     if (file == nil) {
         return reject(@"EISDIR", @"EISDIR: Could not open file for reading", nil);
     }
-    
+
     // Seek to the position if there is one.
     [file seekToFileOffset: (int)position];
-    
+
     NSData *content;
     if ((int)length > 0) {
         content = [file readDataOfLength: (int)length];
     } else {
         content = [file readDataToEndOfFile];
     }
-    
+
     NSString *base64Content = [content base64EncodedStringWithOptions:NSDataBase64EncodingEndLineWithLineFeed];
-    
+
     resolve(base64Content);
 }
 
@@ -422,10 +430,21 @@ RCT_EXPORT_METHOD(downloadFile:(NSDictionary *)options
   params.headers = headers;
   NSNumber* background = options[@"background"];
   params.background = [background boolValue];
+  NSNumber* discretionary = options[@"discretionary"];
+  params.discretionary = [discretionary boolValue];
   NSNumber* progressDivider = options[@"progressDivider"];
   params.progressDivider = progressDivider;
+  NSNumber* readTimeout = options[@"readTimeout"];
+  params.readTimeout = readTimeout;
+
+  __block BOOL callbackFired = NO;
 
   params.completeCallback = ^(NSNumber* statusCode, NSNumber* bytesWritten) {
+    if (callbackFired) {
+      return;
+    }
+    callbackFired = YES;
+
     NSMutableDictionary* result = [[NSMutableDictionary alloc] initWithDictionary: @{@"jobId": jobId}];
     if (statusCode) {
       [result setObject:statusCode forKey: @"statusCode"];
@@ -437,6 +456,10 @@ RCT_EXPORT_METHOD(downloadFile:(NSDictionary *)options
   };
 
   params.errorCallback = ^(NSError* error) {
+    if (callbackFired) {
+      return;
+    }
+    callbackFired = YES;
     return [self reject:reject withError:error];
   };
 
@@ -445,7 +468,7 @@ RCT_EXPORT_METHOD(downloadFile:(NSDictionary *)options
                                                  body:@{@"jobId": jobId,
                                                         @"statusCode": statusCode,
                                                         @"contentLength": contentLength,
-                                                        @"headers": headers}];
+                                                        @"headers": headers ?: [NSNull null]}];
   };
 
   params.progressCallback = ^(NSNumber* contentLength, NSNumber* bytesWritten) {
@@ -454,14 +477,22 @@ RCT_EXPORT_METHOD(downloadFile:(NSDictionary *)options
                                                         @"contentLength": contentLength,
                                                         @"bytesWritten": bytesWritten}];
   };
+    
+    params.resumableCallback = ^() {
+        [self.bridge.eventDispatcher sendAppEventWithName:[NSString stringWithFormat:@"DownloadResumable-%@", jobId] body:nil];
+    };
 
   if (!self.downloaders) self.downloaders = [[NSMutableDictionary alloc] init];
 
   RNFSDownloader* downloader = [RNFSDownloader alloc];
 
-  [downloader downloadFile:params];
+  NSString *uuid = [downloader downloadFile:params];
 
   [self.downloaders setValue:downloader forKey:[jobId stringValue]];
+    if (uuid) {
+        if (!self.uuids) self.uuids = [[NSMutableDictionary alloc] init];
+        [self.uuids setValue:uuid forKey:[jobId stringValue]];
+    }
 }
 
 RCT_EXPORT_METHOD(stopDownload:(nonnull NSNumber *)jobId)
@@ -471,6 +502,44 @@ RCT_EXPORT_METHOD(stopDownload:(nonnull NSNumber *)jobId)
   if (downloader != nil) {
     [downloader stopDownload];
   }
+}
+
+RCT_EXPORT_METHOD(resumeDownload:(nonnull NSNumber *)jobId)
+{
+    RNFSDownloader* downloader = [self.downloaders objectForKey:[jobId stringValue]];
+    
+    if (downloader != nil) {
+        [downloader resumeDownload];
+    }
+}
+
+RCT_EXPORT_METHOD(isResumable:(nonnull NSNumber *)jobId
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject
+)
+{
+    RNFSDownloader* downloader = [self.downloaders objectForKey:[jobId stringValue]];
+    
+    if (downloader != nil) {
+        resolve([NSNumber numberWithBool:[downloader isResumable]]);
+    } else {
+        resolve([NSNumber numberWithBool:NO]);
+    }
+}
+
+RCT_EXPORT_METHOD(completeHandlerIOS:(nonnull NSNumber *)jobId
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+    if (self.uuids) {
+        NSString *uuid = [self.uuids objectForKey:[jobId stringValue]];
+        CompletionHandler completionHandler = [completionHandlers objectForKey:uuid];
+        if (completionHandler) {
+            completionHandler();
+            [completionHandlers removeObjectForKey:uuid];
+        }
+    }
+    resolve(nil);
 }
 
 RCT_EXPORT_METHOD(uploadFiles:(NSDictionary *)options
@@ -601,17 +670,17 @@ RCT_EXPORT_METHOD(getFSInfo:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromise
 
 /**
  * iOS Only: copy images from the assets-library (camera-roll) to a specific path, asuming
- * JPEG-Images. 
- * 
+ * JPEG-Images.
+ *
  * Video-Support:
- * 
+ *
  * One can use this method also to create a thumbNail from a video.
  * Currently it is impossible to specify a concrete position, the OS will decide wich
  * Thumbnail you'll get then.
  * To copy a video from assets-library and save it as a mp4-file, use the method
  * copyAssetsVideoIOS.
- * 
- * It is also supported to scale the image via scale-factor (0.0-1.0) or with a specific 
+ *
+ * It is also supported to scale the image via scale-factor (0.0-1.0) or with a specific
  * width and height. Also the resizeMode will be considered.
  */
 RCT_EXPORT_METHOD(copyAssetsFileIOS: (NSString *) imageUri
@@ -626,31 +695,31 @@ RCT_EXPORT_METHOD(copyAssetsFileIOS: (NSString *) imageUri
 
 {
     CGSize size = CGSizeMake(width, height);
-    
+
     NSURL* url = [NSURL URLWithString:imageUri];
     PHFetchResult *results = [PHAsset fetchAssetsWithALAssetURLs:@[url] options:nil];
-    
+
     if (results.count == 0) {
         NSString *errorText = [NSString stringWithFormat:@"Failed to fetch PHAsset with local identifier %@ with no error message.", imageUri];
-        
+
         NSMutableDictionary* details = [NSMutableDictionary dictionary];
         [details setValue:errorText forKey:NSLocalizedDescriptionKey];
         NSError *error = [NSError errorWithDomain:@"RNFS" code:500 userInfo:details];
         [self reject: reject withError:error];
         return;
     }
-    
+
     PHAsset *asset = [results firstObject];
     PHImageRequestOptions *imageOptions = [PHImageRequestOptions new];
-    
+
     // Allow us to fetch images from iCloud
     imageOptions.networkAccessAllowed = YES;
-    
-    
+
+
     // Note: PhotoKit defaults to a deliveryMode of PHImageRequestOptionsDeliveryModeOpportunistic
     // which means it may call back multiple times - we probably don't want that
     imageOptions.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
-    
+
     BOOL useMaximumSize = CGSizeEqualToSize(size, CGSizeZero);
     CGSize targetSize;
     if (useMaximumSize) {
@@ -660,12 +729,12 @@ RCT_EXPORT_METHOD(copyAssetsFileIOS: (NSString *) imageUri
         targetSize = CGSizeApplyAffineTransform(size, CGAffineTransformMakeScale(scale, scale));
         imageOptions.resizeMode = PHImageRequestOptionsResizeModeFast;
     }
-    
+
     PHImageContentMode contentMode = PHImageContentModeAspectFill;
     if (resizeMode == RCTResizeModeContain) {
         contentMode = PHImageContentModeAspectFit;
     }
-    
+
     // PHImageRequestID requestID =
     [[PHImageManager defaultManager] requestImageForAsset:asset
                                                targetSize:targetSize
@@ -673,49 +742,48 @@ RCT_EXPORT_METHOD(copyAssetsFileIOS: (NSString *) imageUri
                                                   options:imageOptions
                                             resultHandler:^(UIImage *result, NSDictionary<NSString *, id> *info) {
         if (result) {
-            
+
             NSData *imageData = UIImageJPEGRepresentation(result, compression );
             [imageData writeToFile:destination atomically:YES];
             resolve(destination);
-            
+
         } else {
             NSMutableDictionary* details = [NSMutableDictionary dictionary];
             [details setValue:info[PHImageErrorKey] forKey:NSLocalizedDescriptionKey];
             NSError *error = [NSError errorWithDomain:@"RNFS" code:501 userInfo:details];
             [self reject: reject withError:error];
-            
+
         }
     }];
 }
 
 /**
  * iOS Only: copy videos from the assets-library (camera-roll) to a specific path as mp4-file.
- * 
+ *
  * To create a thumbnail from the video, refer to copyAssetsFileIOS
  */
 RCT_EXPORT_METHOD(copyAssetsVideoIOS: (NSString *) imageUri
                   atFilepath: (NSString *) destination
                   resolver: (RCTPromiseResolveBlock) resolve
                   rejecter: (RCTPromiseRejectBlock) reject)
-
 {
   NSURL* url = [NSURL URLWithString:imageUri];
   __block NSURL* videoURL = [NSURL URLWithString:destination];
-  
+  __block NSError *error = nil;
   PHFetchResult *phAssetFetchResult = [PHAsset fetchAssetsWithALAssetURLs:@[url] options:nil];
   PHAsset *phAsset = [phAssetFetchResult firstObject];
   dispatch_group_t group = dispatch_group_create();
   dispatch_group_enter(group);
-  
+
   [[PHImageManager defaultManager] requestAVAssetForVideo:phAsset options:nil resultHandler:^(AVAsset *asset, AVAudioMix *audioMix, NSDictionary *info) {
-    
+
     if ([asset isKindOfClass:[AVURLAsset class]]) {
       NSURL *url = [(AVURLAsset *)asset URL];
       NSLog(@"Final URL %@",url);
       NSData *videoData = [NSData dataWithContentsOfURL:url];
-      
-      BOOL writeResult = [videoData writeToFile:destination atomically:true];
-      
+
+      BOOL writeResult = [videoData writeToFile:destination options:NSDataWritingAtomic error:&error];
+
       if(writeResult) {
         NSLog(@"video success");
       }
@@ -726,7 +794,13 @@ RCT_EXPORT_METHOD(copyAssetsVideoIOS: (NSString *) imageUri
     }
   }];
   dispatch_group_wait(group,  DISPATCH_TIME_FOREVER);
-  resolve(destination);
+
+  if (error) {
+    NSLog(@"RNFS: %@", error);
+    return [self reject:reject withError:error];
+  }
+
+  return resolve(destination);
 }
 
 RCT_EXPORT_METHOD(touch:(NSString*)filepath
@@ -792,6 +866,12 @@ RCT_EXPORT_METHOD(touch:(NSString*)filepath
            @"RNFSFileTypeRegular": NSFileTypeRegular,
            @"RNFSFileTypeDirectory": NSFileTypeDirectory
            };
+}
+
++(void)setCompletionHandlerForIdentifier: (NSString *)identifier completionHandler: (CompletionHandler)completionHandler
+{
+    if (!completionHandlers) completionHandlers = [[NSMutableDictionary alloc] init];
+    [completionHandlers setValue:completionHandler forKey:identifier];
 }
 
 @end

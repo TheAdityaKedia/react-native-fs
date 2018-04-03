@@ -33,7 +33,7 @@ type MkdirOptions = {
 
 type ReadDirItem = {
   ctime: ?Date;    // The creation date of the file (iOS only)
-  mtime: Date;   // The last modified date of the file
+  mtime: ?Date;    // The last modified date of the file
   name: string;     // The name of the item
   path: string;     // The absolute path to the item
   size: string;     // Size in bytes
@@ -47,7 +47,7 @@ type StatResult = {
   size: string;     // Size in bytes
   mode: number;     // UNIX file mode
   ctime: number;    // Created date
-  utime: number;    // Updated date
+  mtime: number;    // Last modified date
   isFile: () => boolean;        // Is the file just a file?
   isDirectory: () => boolean;   // Is the file a directory?
 };
@@ -59,12 +59,14 @@ type DownloadFileOptions = {
   fromUrl: string;          // URL to download file from
   toFile: string;           // Local filesystem path to save the file to
   headers?: Headers;        // An object of headers to be passed to the server
-  background?: boolean;     // iOS only
+  background?: boolean;     // Continue the download in the background after the app terminates (iOS only)
+  discretionary?: boolean;  // Allow the OS to control the timing and speed of the download to improve perceived performance  (iOS only)
   progressDivider?: number;
-  readTimeout?: number;
-  connectionTimeout?: number;
   begin?: (res: DownloadBeginCallbackResult) => void;
   progress?: (res: DownloadProgressCallbackResult) => void;
+  resumable?: () => void;    // only supported on iOS yet
+  connectionTimeout?: number; // only supported on Android yet
+  readTimeout?: number;       // supported on Android and iOS
 };
 
 type DownloadBeginCallbackResult = {
@@ -165,7 +167,7 @@ function readDirGeneric(dirpath: string, command: Function) {
   return command(normalizeFilePath(dirpath)).then(files => {
     return files.map(file => ({
       ctime: file.ctime && new Date(file.ctime * 1000) || null,
-      mtime: new Date(file.mtime * 1000),
+      mtime: file.mtime && new Date(file.mtime * 1000) || null,
       name: file.name,
       path: file.path,
       size: file.size,
@@ -201,6 +203,10 @@ var RNFS = {
     return RNFSManager.getFSInfo();
   },
 
+  getAllExternalFilesDirs(): Promise<string> {
+    return RNFSManager.getAllExternalFilesDirs();
+  },
+
   unlink(filepath: string): Promise<void> {
     return RNFSManager.unlink(normalizeFilePath(filepath)).then(() => void 0);
   },
@@ -213,8 +219,20 @@ var RNFS = {
     RNFSManager.stopDownload(jobId);
   },
 
+  resumeDownload(jobId: number): void {
+      RNFSManager.resumeDownload(jobId);
+  },
+
+  isResumable(jobId: number): Promise<bool> {
+      return RNFSManager.isResumable(jobId);
+  },
+
   stopUpload(jobId: number): void {
     RNFSManager.stopUpload(jobId);
+  },
+
+  completeHandlerIOS(jobId: number): void {
+    return RNFSManager.completeHandlerIOS(jobId);
   },
 
   readDir(dirpath: string): Promise<ReadDirItem[]> {
@@ -269,7 +287,7 @@ var RNFS = {
   },
 
   read(filepath: string, length: number = 0, position: number = 0, encodingOrOptions?: any): Promise<string> {
-  	var options = {
+    var options = {
       encoding: 'utf8'
     };
 
@@ -307,7 +325,7 @@ var RNFS = {
   },
 
   hash(filepath: string, algorithm: string): Promise<string> {
-    return RNFSManager.hash(filepath, algorithm);
+    return RNFSManager.hash(normalizeFilePath(filepath), algorithm);
   },
 
   // Android only
@@ -444,6 +462,10 @@ var RNFS = {
       subscriptions.push(NativeAppEventEmitter.addListener('DownloadProgress-' + jobId, options.progress));
     }
 
+    if (options.resumable) {
+      subscriptions.push(NativeAppEventEmitter.addListener('DownloadResumable-' + jobId, options.resumable));
+    }
+
     var bridgeOptions = {
       jobId: jobId,
       fromUrl: options.fromUrl,
@@ -460,6 +482,9 @@ var RNFS = {
       promise: RNFSManager.downloadFile(bridgeOptions).then(res => {
         subscriptions.forEach(sub => sub.remove());
         return res;
+      })
+      .catch( e => {
+        return Promise.reject(e);
       })
     };
   },
